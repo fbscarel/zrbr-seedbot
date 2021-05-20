@@ -1,78 +1,177 @@
 from sqlalchemy import create_engine, select
-from sqlalchemy.orm import sessionmaker, scoped_session
+from sqlalchemy.orm import sessionmaker
 
 from datetime import datetime
 
-from datatypes import Games
+from datatypes import EntryStatus, WeeklyStatus
 from database.model import PlayerEntry, Weekly, Base
+
+import logging
+logger = logging.getLogger(__name__)
+
+
+class ConsistencyError(Exception):
+    pass
 
 
 class Database:
-    def __init__(self, dbpath, echo=False, future=True):
-        self.engine = create_engine('sqlite+pysqlite:///' + dbpath, echo=echo, future=future)
-        self.Session = scoped_session(sessionmaker(self.engine, future=future))
+    def __init__(
+            self,
+            *,
+            dialect,
+            dbapi="",
+            user="",
+            password="",
+            host="",
+            port="",
+            dbpath,
+            engine_options=None
+    ):
+        url = Database.build_database_url(
+            dialect=dialect,
+            dbapi=dbapi,
+            user=user,
+            password=password,
+            host=host,
+            port=port,
+            dbpath=dbpath
+        )
+        options = engine_options or {}
+        self.engine = create_engine(url, **options, future=True)
+        self.Session = sessionmaker(self.engine, future=True)
 
-    def get_weekly(self, selector):
-        if isinstance(selector, Games):
-            return self.get_current_weekly(selector)
-        return self.Session.get(Weekly, selector)
+    def get_weekly(self, session, weekly_id):
+        return session.get(Weekly, weekly_id)
 
-    def get_current_weekly(self, game):
-        return self.Session.execute(
-            select(Weekly)
-                .where(Weekly.game == game)
-                .order_by(Weekly.created_at.desc())
+    def get_open_weekly(self, session, game):
+        return session.execute(
+            select(Weekly).where(Weekly.game == game, Weekly.status == WeeklyStatus.OPEN).order_by(
+                Weekly.created_at.desc()
+            )
         ).scalars().first()
 
-    def create_weekly(self, game, seed_url, seed_hash, submission_end):
+    def list_open_weeklies(self, session):
+        return session.execute(
+            select(Weekly).where(Weekly.status == WeeklyStatus.OPEN)
+        ).scalars().all()
+
+    def create_weekly(self, session, game, seed_url, seed_hash, submission_end, *, force_close=False):
+        open_weekly = self.get_open_weekly(session, game)
+        if open_weekly is not None:
+            if force_close:
+                self.close_weekly(session, open_weekly)
+            else:
+                raise ConsistencyError(
+                    "Attempt to create a weekly while another one for the same game is still open"
+                )
+
         weekly = Weekly(
             game=game,
+            status=WeeklyStatus.OPEN,
             seed_url=seed_url,
             seed_hash=seed_hash,
             created_at=datetime.now(),
             submission_end=submission_end
         )
-        self.Session.add(weekly)
-        self.Session.commit()
+        session.add(weekly)
+        session.commit()
+        logger.debug("A weekly was created: %s", weekly)
         return weekly
 
-    def update_weekly(self, selector, **kwargs):
-        weekly = self.get_weekly(selector)
-        if weekly is not None:
-            for key, value in kwargs.items():
-                setattr(weekly, key, value)
-            self.Session.commit()
+    def close_weekly(self, session, weekly):
+        for entry in weekly.entries:
+            if entry.status == EntryStatus.REGISTERED:
+                entry.status = EntryStatus.DNF
+        weekly.status = WeeklyStatus.CLOSED
+        session.commit()
+        logger.debug("A weekly was closed: %s", weekly)
 
-    def close_current_weekly(self, game):
-        self.update_weekly(game, submission_end=datetime.now())
+    def get_player_entry(self, session, weekly, discord_id):
+        return session.get(PlayerEntry, (weekly.id, discord_id))
 
-    def get_player_entry(self, weekly, player_id):
-        return self.Session.get(PlayerEntry, (weekly.id, player_id))
+    def get_registered_entry(self, session, discord_id):
+        registered = session.execute(
+            select(PlayerEntry).where(PlayerEntry.discord_id == discord_id,
+                                      PlayerEntry.status == EntryStatus.REGISTERED)
+        ).scalars().all()
 
-    def register(self, weekly, player_id):
+        if len(registered) == 0:
+            return None
+
+        if len(registered) > 1:
+            logging.error(
+                "An inconsistency was found while quering the database: user %d has more than one 'REGISTERED' entry.",
+                discord_id
+            )
+        return registered[0]
+
+    def register_player(self, session, weekly, discord_id, discord_name):
+        if self.get_registered_entry(session, discord_id) is not None:
+            raise ConsistencyError(
+                "Attempt to register a player that is already registered to a weekly."
+            )
+
         entry = PlayerEntry(
-            discord_id=player_id,
             weekly=weekly,
+            discord_id=discord_id,
+            discord_name=discord_name,
+            status=EntryStatus.REGISTERED,
             registered_at=datetime.now()
         )
-        self.Session.add(entry)
-        self.Session.commit()
+        session.add(entry)
+        session.commit()
+        logger.debug("A new entry was created: %s", entry)
         return entry
 
-    def submit_time(self, weekly, player_id, finish_time, print_url):
-        entry = self.get_player_entry(weekly, player_id)
+    def forfeit_player(self, session, weekly, discord_id):
+        entry = self.get_player_entry(session, weekly, discord_id)
+        if entry.status != EntryStatus.REGISTERED:
+            raise ConsistencyError(
+                "Attempt to forfeit a player that is not registered to a weekly."
+            )
+        entry.status = EntryStatus.DNF
+        session.commit()
+        logger.debug("Entry changed: %s", entry)
+
+    def submit_time(self, session, weekly, discord_id, finish_time, print_url):
+        entry = self.get_player_entry(session, weekly, discord_id)
+        if entry.status != EntryStatus.REGISTERED:
+            raise ConsistencyError(
+                "Attempt to register a time for a player that is not registered to a weekly."
+            )
         entry.finish_time = finish_time
         entry.print_url = print_url
         entry.time_submitted_at = datetime.now()
-        self.Session.commit()
+        entry.status = EntryStatus.TIME_SUBMITTED
+        session.commit()
+        logger.debug("Entry changed: %s", entry)
 
-    def submit_vod(self, weekly, player_id, vod_url):
-        entry = self.get_player_entry(weekly, player_id)
+    def submit_vod(self, session, weekly, discord_id, vod_url):
+        entry = self.get_player_entry(session, weekly, discord_id)
+        if entry.status != EntryStatus.TIME_SUBMITTED:
+            raise ConsistencyError(
+                "Attempt to register a VOD for a player that did not have a time submitted for their weekly."
+            )
+        entry.status = EntryStatus.DONE
         entry.vod_url = vod_url
         entry.vod_submitted_at = datetime.now()
-        self.Session.commit()
+        session.commit()
+        logger.debug("Entry changed: %s", entry)
 
     def _generate_schema(self):
         Base.metadata.drop_all(self.engine)
         Base.metadata.create_all(self.engine)
-        self.Session.remove()
+
+    @staticmethod
+    def build_database_url(*, dialect, dbapi="", user="", password="", host="", port="", dbpath):
+        def add_if_not_none(value, *, prefix="", suffix=""):
+            if value is not None and len(value) > 0:
+                return prefix + value + suffix
+            return ""
+
+        url = dialect + add_if_not_none(dbapi, prefix="+") + "://"
+        auth = add_if_not_none(user) + add_if_not_none(password, prefix=":")
+        url += add_if_not_none(auth, suffix="@") + host + add_if_not_none(port, prefix=":") + "/"
+        url += dbpath
+
+        return url
